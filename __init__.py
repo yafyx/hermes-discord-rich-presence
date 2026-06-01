@@ -1,50 +1,31 @@
-"""discord-rich-presence — periodic Discord Rich Presence updates.
-
-Hooks into ``pre_gateway_dispatch`` to:
-
-1. Lazily discover the running Discord adapter on first message
-2. Start a background asyncio task that rotates the bot's activity
-   status every 30 seconds through current Hermes workload signals:
-
-     Today: N sessions / M messages
-     Open: N sessions on <source>
-     Latest: <session title>
-     Model: <active model>
-     Last Discord msg Xm ago
-
-3. Track incoming Discord message volume for the stats
-
-No Hermes internal code is touched — the plugin monkey-patches nothing
-and lives entirely in ``~/.hermes/plugins/discord-rich-presence/``.
-Session DB stats are cached for five minutes between refreshes.
-
-Toggle with env var ``DISCORD_PRESENCE_ENABLED=false``.
-"""
+"""Discord Rich Presence updates from recent Hermes activity."""
 
 from __future__ import annotations
 
+import asyncio
+import datetime
 import logging
 import os
+import sqlite3
 import time
-import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from utils import is_truthy_value
+
 logger = logging.getLogger(__name__)
 
-# -- Internal state -----------------------------------------------------
-
-_controllers: dict[int, "PresenceController"] = {}
+_controller: "PresenceController | None" = None
 
 _PRESENCE_INTERVAL = 30
 _SESSION_STATS_TTL = 300
+_SESSION_STATS_FAILURE_BACKOFF = 30
 _MAX_LABEL_LEN = 128
-_PRESENCE_ENABLED = (
-    os.getenv("DISCORD_PRESENCE_ENABLED", "true").lower() in {"true", "1", "yes"}
+_PRESENCE_ENABLED = is_truthy_value(
+    os.getenv("DISCORD_PRESENCE_ENABLED", "true"),
+    default=True,
 )
 
-
-# ── Helpers ───────────────────────────────────────────────────────────
 
 def _truncate(value: str, max_len: int = _MAX_LABEL_LEN) -> str:
     if len(value) <= max_len:
@@ -92,30 +73,34 @@ class SessionStatsCache:
         self._ttl_seconds = ttl_seconds
         self._stats = SessionStats()
         self._loaded_at = 0.0
+        self._retry_after = 0.0
 
     def get(self, now: float) -> CachedSessionStats:
         if self._loaded_at and now - self._loaded_at < self._ttl_seconds:
             return CachedSessionStats(self._stats, refreshed=False)
+        if now < self._retry_after:
+            return CachedSessionStats(self._stats, refreshed=False)
 
-        self._stats = self._read(now)
+        stats = self._read(now)
+        if stats is None:
+            self._retry_after = now + _SESSION_STATS_FAILURE_BACKOFF
+            return CachedSessionStats(self._stats, refreshed=False)
+
+        self._stats = stats
         self._loaded_at = now
+        self._retry_after = 0.0
         return CachedSessionStats(self._stats, refreshed=True)
 
-    def _read(self, now: float) -> SessionStats:
+    def _read(self, now: float) -> SessionStats | None:
         try:
-            import datetime
-            import sqlite3
             from hermes_constants import get_hermes_home
 
             db_path = get_hermes_home() / "state.db"
-            if not db_path.exists():
-                return SessionStats()
-
             today_start = datetime.datetime.fromtimestamp(now).astimezone().replace(
                 hour=0, minute=0, second=0, microsecond=0
             ).timestamp()
 
-            conn = sqlite3.connect(str(db_path), timeout=2)
+            conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True, timeout=2)
             conn.row_factory = sqlite3.Row
             try:
                 totals = conn.execute(
@@ -155,12 +140,9 @@ class SessionStatsCache:
                     else None
                 ),
             )
-        except Exception:
+        except (ImportError, OSError, sqlite3.Error, TypeError, ValueError):
             logger.debug("discord-rich-presence: failed to read session stats", exc_info=True)
-            return SessionStats()
-
-
-# ── Presence loop ─────────────────────────────────────────────────────
+            return None
 
 _MODES = ["today", "open", "latest", "model", "activity"]
 
@@ -171,16 +153,22 @@ class PresenceController:
     def __init__(
         self,
         adapter: Any,
+        platform: Any,
         *,
         interval: int = _PRESENCE_INTERVAL,
         stats_cache: SessionStatsCache | None = None,
     ) -> None:
         self._adapter = adapter
+        self._platform = platform
         self._interval = interval
         self._stats_cache = stats_cache or SessionStatsCache()
         self._task: asyncio.Task | None = None
         self._message_delta = 0
         self._last_msg_time = 0.0
+
+    @property
+    def adapter(self) -> Any:
+        return self._adapter
 
     def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -189,8 +177,13 @@ class PresenceController:
         loop = asyncio.get_running_loop()
         self._task = loop.create_task(self._presence_loop())
 
+    def stop(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        self._task = None
+
     def track_event(self, event: Any, now: float | None = None) -> None:
-        if not _is_discord_event(event):
+        if not _is_platform_event(event, self._platform):
             return
         self._message_delta += 1
         self._last_msg_time = now if now is not None else time.time()
@@ -266,45 +259,47 @@ class PresenceController:
                 await asyncio.sleep(60)
 
 
-# ── Initialisation ────────────────────────────────────────────────────
+def _get_controller(gateway: Any) -> PresenceController | None:
+    """Return the active controller, starting or replacing it when needed."""
+    global _controller
 
-def _ensure_initialized(gateway) -> None:
-    """Lazily discover the Discord adapter and start its presence loop.
-
-    Safe to call on every message; creates one controller per adapter instance.
-    """
     if not _PRESENCE_ENABLED:
-        return
+        return None
 
     try:
         from gateway.config import Platform
+    except ImportError as exc:
+        logger.warning("discord-rich-presence: cannot import Hermes Platform: %s", exc)
+        return None
 
-        adapter = gateway.adapters.get(Platform.DISCORD)
-        if adapter is None:
-            return  # not connected yet — retry on next message
+    adapters = getattr(gateway, "adapters", None)
+    if adapters is None:
+        logger.warning("discord-rich-presence: gateway has no adapters mapping")
+        return None
 
-        controller = _controllers.get(id(adapter))
-        if controller is None:
-            controller = PresenceController(adapter)
-            _controllers[id(adapter)] = controller
-            bot_user = getattr(getattr(adapter, "_client", None), "user", None)
-            logger.info("discord-rich-presence: activated for %s", bot_user)
+    adapter = adapters.get(Platform.DISCORD)
+    if adapter is None:
+        return None
 
-        controller.start()
+    if _controller is not None and _controller.adapter is not adapter:
+        _controller.stop()
+        _controller = None
 
-    except Exception as exc:
-        logger.debug("discord-rich-presence: init failed: %s", exc)
+    if _controller is None:
+        _controller = PresenceController(adapter, Platform.DISCORD)
+        bot_user = getattr(getattr(adapter, "_client", None), "user", None)
+        logger.info("discord-rich-presence: activated for %s", bot_user)
+
+    _controller.start()
+    return _controller
 
 
-def _is_discord_event(event: Any) -> bool:
+def _is_platform_event(event: Any, platform: Any) -> bool:
     source = getattr(event, "source", None)
     if source is None:
         return False
-    platform = getattr(source, "platform", None)
-    return platform is not None and getattr(platform, "value", None) == "discord"
+    return getattr(source, "platform", None) == platform
 
-
-# ── Hook handler ──────────────────────────────────────────────────────
 
 def _on_pre_gateway_dispatch(**kwargs: Any) -> None:
     """pre_gateway_dispatch hook: init tracking + count Discord messages."""
@@ -314,20 +309,10 @@ def _on_pre_gateway_dispatch(**kwargs: Any) -> None:
     if gateway is None:
         return
 
-    _ensure_initialized(gateway)
+    controller = _get_controller(gateway)
+    if controller is not None:
+        controller.track_event(event)
 
-    try:
-        from gateway.config import Platform
-
-        adapter = gateway.adapters.get(Platform.DISCORD)
-        controller = _controllers.get(id(adapter)) if adapter is not None else None
-        if controller is not None:
-            controller.track_event(event)
-    except Exception:
-        logger.debug("discord-rich-presence: message tracking failed", exc_info=True)
-
-
-# ── Plugin entry point ────────────────────────────────────────────────
 
 def register(ctx) -> None:
     """Register the pre_gateway_dispatch hook."""

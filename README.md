@@ -51,6 +51,7 @@ DISCORD_PRESENCE_ENABLED=false
 - The plugin avoids monkey-patching the Discord adapter or Hermes runtime internals.
 - Stats come from `~/.hermes/state.db`, so today's totals survive plugin restarts.
 - Session stats are cached for 5 minutes. Discord message deltas are counted in memory between cache refreshes.
+- If the database is temporarily unavailable, the plugin keeps the last stats and retries after 30 seconds.
 - Labels stay under Discord's custom status length.
 
 ## Development check
