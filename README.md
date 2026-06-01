@@ -1,10 +1,10 @@
 # Hermes Discord Rich Presence
 
-Hermes plugin that rotates the Discord bot's custom Rich Presence through compact runtime signals from `~/.hermes/state.db`.
+Hermes plugin that sets the Discord bot's Rich Presence from recent Hermes activity in `~/.hermes/state.db`.
 
-It does not patch Hermes core. It registers the `pre_gateway_dispatch` hook, discovers the running Discord adapter lazily, and updates the bot status in the background.
+It does not patch Hermes core. It registers `pre_gateway_dispatch`, finds the running Discord adapter, and updates the bot status in the background.
 
-## Presence Rotation
+## Presence rotation
 
 Examples:
 
@@ -16,7 +16,7 @@ Model: deepseek-v4-flash
 Last Discord msg 4m ago
 ```
 
-The plugin intentionally avoids decorative "online" labels. If the bot is visible in Discord, online state is already obvious; the presence text should carry operational information.
+There is no "online" label. Discord already shows that. The status text is for useful runtime context.
 
 ## Install
 
@@ -38,22 +38,21 @@ Hermes loads plugins at process startup, so a gateway restart is required after 
 
 ## Configuration
 
-Set this environment variable before starting Hermes to disable updates without uninstalling the plugin:
+Set this before starting Hermes to disable updates without uninstalling the plugin:
 
 ```bash
 DISCORD_PRESENCE_ENABLED=false
 ```
 
-## Behavior Notes
+## Behavior notes
 
 - The presence loop starts after the first inbound Discord gateway message because Hermes currently exposes this plugin through `pre_gateway_dispatch`.
-- Stats are read from `~/.hermes/state.db`, so today's session/message totals survive plugin restarts.
-- The plugin only uses Discord custom activity text and keeps labels under Discord's custom status length.
+- Stats come from `~/.hermes/state.db`, so today's totals survive plugin restarts.
+- Labels stay under Discord's custom status length.
 
-## Development Check
+## Development check
 
 ```bash
 python -m py_compile __init__.py
 hermes plugins list --plain --no-bundled
 ```
-
