@@ -47,7 +47,10 @@ DISCORD_PRESENCE_ENABLED=false
 ## Behavior notes
 
 - The presence loop starts after the first inbound Discord gateway message because Hermes currently exposes this plugin through `pre_gateway_dispatch`.
+- Startup presence before the first message is not implemented because Hermes does not expose an official Discord-ready plugin hook.
+- The plugin avoids monkey-patching the Discord adapter or Hermes runtime internals.
 - Stats come from `~/.hermes/state.db`, so today's totals survive plugin restarts.
+- Session stats are cached for 5 minutes. Discord message deltas are counted in memory between cache refreshes.
 - Labels stay under Discord's custom status length.
 
 ## Development check

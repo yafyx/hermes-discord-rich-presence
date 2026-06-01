@@ -1,6 +1,6 @@
 name: discord-rich-presence
-version: "0.1.0"
-description: "Periodic Discord Rich Presence updates — rotates the bot's activity status every 30s through system-state info (session count, message count, uptime, last activity). Hooks into pre_gateway_dispatch to lazily discover the Discord adapter. No Hermes core code modified."
+version: "0.2.0"
+description: "Hermes Discord Rich Presence plugin that rotates recent session, message, model, and activity status from cached Hermes state. Uses supported plugin hooks only and does not patch Hermes core."
 author: "yafyx"
 provides_hooks:
   - pre_gateway_dispatch
